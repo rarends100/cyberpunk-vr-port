@@ -50,14 +50,46 @@ end
 
 local installed = false
 local installTimer = 0.0
+-- local plProbeAt = nil -- RA01
+local axisProbeAt = nil -- RA01
+local muzzleDebugAt = nil --RA01
 
 -- VR motion-melee tuning + state. A VR swing (the player's own hand = the animation) deals damage via
 -- redscript on the touched enemy. NO RT injection (that would play the game's own attack animation).
 local meleeEnabled = true
 local meleePrevRel = nil       -- weapon pos relative to player, last frame (so walking != a swing)
-local MELEE_SWING_SPEED = 2.5  -- m/s of weapon motion relative to player — peaks at 2-5 m/s on a real swing
+local MELEE_SWING_SPEED = 3.5  -- m/s of weapon motion relative to player — peaks at 2-5 m/s on a real swing - Gates the swing speed needed to initiate and attack on both melee cyberwear and melee weapons RA01
+                                -- RA01: raised from 2.5 -- required a faster swing to register a hit
+local MELEE_REARM_SPEED = 1.5  -- m/s: hand must slow below this before the next RT tap can fire -- RA01
 local MELEE_BOX = 0.22         -- blade hit radius (m) — tight to NPC body silhouette
 
+-- Cyberware -- Cyberarms variables
+local mantisPrevHand = nil     -- right-hand raw position, last frame (mantis blades only) --RA01
+local mantisPrevHandLeft = nil -- RA01: left-hand equivalent, so a swing from either arm fires RT --
+                                -- these cyberware are dual-wielded (both forearms), and the swing
+                                -- detector only ever watched the right hand until now
+local cyberMeleeArmLoggedOnce = { mantis = false, gorilla = false, monowire = false } -- logging variable RA01
+local cyberMeleeArmArmed = true -- RA01: gate so RT taps once per swing, not every frame above threshold
+local cyberMeleeArmArmedLeft = true -- RA01: left hand's own re-arm gate, independent of the right's
+-- RA01: PERSISTENT weapon classification cache, keyed on the equipped weapon's entity-id hash (the
+-- same identity check killCameraRecoil and the equip-sound logic below already use). See the big
+-- comment in onUpdate where this is refreshed for why this exists: TDBID.ToStringDEBUG on the
+-- SAME item, called fresh every single frame, was proven (via weaponflag_probe.txt) to reliably
+-- misclassify Mantis Blades/Gorilla Arms/Monowire while getting real guns and the Launcher right
+-- every time -- while killCameraRecoil's identical call, which only ever runs ONCE per equip
+-- thanks to its own `recoilKilled == wid` guard, got EVERY item right 100% of the time in
+-- recoil_probe.txt across three full test sessions. Classify once per equip, cache it, stop calling
+-- TDBID.ToStringDEBUG every frame at all. Both probe files above are gone now -- they and a later
+-- round of native/Lua probing (also since removed) are written up in
+-- docs/cyberware-arm-visual-bug-investigation.md, including the actual, external, non-code cause
+-- of the visual bug that motivated all of this.
+local weaponClassifyWid = nil
+local weaponClassifyLow = nil
+local weaponClassifyIsMelee = false
+local weaponClassifyIsMantis = false
+local weaponClassifyIsGorilla = false
+local weaponClassifyIsMonowire = false
+local weaponClassifyIsLauncher = false
 -- SWING WHOOSH: in the flat game the whoosh rides on the attack anim's audio events, which a VR
 -- swing never plays — so redscript VRMeleeWhoosh replays the weapon's own audio-config whoosh
 -- (per-family, positional on the weapon). Fired here on the swing EDGE: once per swing episode
@@ -299,7 +331,8 @@ local function killCameraRecoil(wpn, wid)
         -- shotgun first: it is the one class that wants both halves, and 'shotgundual' contains none
         -- of the other tokens
         if string.find(low, 'shotgun', 1, true) then cls = 3
-        elseif string.find(low, 'handgun', 1, true) or string.find(low, 'revolver', 1, true) then cls = 1
+        elseif string.find(low, 'handgun', 1, true) or string.find(low, 'revolver', 1, true)
+            or string.find(low, 'launcher', 1, true) or string.find(low, 'projectilelauncher', 1, true) then cls = 1 -- RA01
         -- SNIPERS BEFORE RIFLES, or 'sniperrifle' would be caught by the 'rifle' token below and lose
         -- its own class. The precision family goes with them: it is the semi-automatic half of the same
         -- thing and fires the same class of round.
@@ -314,37 +347,13 @@ local function killCameraRecoil(wpn, wid)
             or string.find(low, 'axe', 1, true)     or string.find(low, 'hammer', 1, true)
             or string.find(low, 'club', 1, true)    or string.find(low, 'chainsword', 1, true)
             or string.find(low, 'sword', 1, true)   or string.find(low, 'fists', 1, true)
-            or string.find(low, 'melee', 1, true)   then cls = 5
+            or string.find(low, 'melee', 1, true) then cls = 5
         end
     end
     if type(SetVRWeaponClass) == 'function' then SetVRWeaponClass(cls) end
-    -- ...AND INTO THE PROBE FILE, not only into the log. The module's spdlog stops accepting lines after
-    -- a mod reload (measured, and the reason this probe file exists at all), so anything that has to be
-    -- readable after the fact goes where the kick already goes.
     VRP_lastClass, VRP_lastItemType = cls, itName
-    pcall(function()
-        local f = io.open('recoil_probe.txt', 'a')
-        if f then
-            f:write(string.format('class=%d type=%s key=%s', cls, tostring(itName), tostring(key)))
-            f:write(string.char(10))
-            f:close()
-        end
-    end)
     logAlways('recoil: itemType=%s class=%d', tostring(itName), cls)
     logAlways('recoil: key=%s kick=%s', tostring(key), tostring(kick))
-    -- STRAIGHT TO A FILE, because the module's spdlog log stopped accepting lines after a mod reload
-    -- (the file was reopened and nothing more was appended, while the value provably reached the
-    -- plugin). A diagnostic that can go quiet is worse than none: this one is opened, written, flushed
-    -- and closed on the spot, so what it says is what happened.
-    pcall(function()
-        local f = io.open('recoil_probe.txt', 'a')
-        if f then
-            f:write(string.format('key=%s kick=%s wid=%s cls=%s type=%s', tostring(key), tostring(kick),
-                                  tostring(wid), tostring(VRP_lastClass), tostring(VRP_lastItemType)))
-            f:write(string.char(10))
-            f:close()
-        end
-    end)
 
     local sid = nil
     pcall(function()
@@ -429,9 +438,153 @@ local CARRY_TOL_M     = 0.01      -- a centimetre is close enough to stop
 local CARRY_MAX_TRIES = 3
 local muzzlePosProbed = false
 local muzzleEnumDone = false
-local function updateMuzzle(wpn)
+
+-- Cyberware arm fix - projectile launcher start - RA01 p1
+
+-- VRHandRawRot's raw orientation doesn't point where the launcher visually does -- confirmed by
+-- testing: shots landed consistently ~35 deg right and ~45 deg up from where the hand pointed.
+-- These two offsets rotate the published direction to compensate, done in WORLD space around the
+-- hand's OWN current right/up axes (from the already-verified GetRight/GetUp), so we don't have to
+-- guess which local axis index means "up" in this engine's convention.
+--
+-- Signs are a first guess from the reported error (rotate left/down to cancel a right/up bias).
+-- If a shot still drifts the same way, increase the magnitude; if it swings the OPPOSITE way
+-- (e.g. now goes left instead of centered), you overshot -- try half the value; if it goes
+-- somewhere unrelated entirely, negate the sign.
+local AIM_YAW_OFFSET_DEG   = -35.0   -- around the hand's current up axis
+local AIM_PITCH_OFFSET_DEG = -90.0   -- around the hand's current right axis
+
+local MUZZLE_TIP_OFFSET_FWD   = 0.20
+local MUZZLE_TIP_OFFSET_RIGHT = 0.00
+local MUZZLE_TIP_OFFSET_UP    = 0.00
+
+local function hamiltonMul(a, b)
+    return {
+        r = a.r*b.r - a.i*b.i - a.j*b.j - a.k*b.k,
+        i = a.r*b.i + a.i*b.r + a.j*b.k - a.k*b.j,
+        j = a.r*b.j - a.i*b.k + a.j*b.r + a.k*b.i,
+        k = a.r*b.k + a.i*b.j - a.j*b.i + a.k*b.r,
+    }
+end
+
+local function axisAngleQuat(axis, angleDeg)
+    local half = math.rad(angleDeg) * 0.5
+    local s = math.sin(half)
+    return { i = axis.x * s, j = axis.y * s, k = axis.z * s, r = math.cos(half) }
+end
+
+-- HEAD AIM for the projectile launcher specifically. The native toggle in HeadAimWeapon.cpp is a
+-- single global on/off switch with no per-weapon hook exposed to CET -- doing this natively would
+-- need a source change and a DLL rebuild. Same result without touching native code: since this
+-- weapon's whole muzzle publish already goes through here, swap the DIRECTION we publish to the
+-- camera's orientation instead of the hand's. The ORIGIN still comes from the hand -- that's a
+-- physical correction (wrist pivot -> barrel tip), unrelated to which way you're aiming.
+local headAimLoggedOnce = false
+
+local function publishMuzzleFromHand(x, y, z, qi, qj, qk, qr)
+    local handQ = Quaternion.new(qi, qj, qk, qr)
+
+    -- Pick the aim direction: camera orientation if we can get it, hand rotation as a safety
+    -- fallback if that call ever fails, so a bad lookup falls back to hand-aim instead of breaking
+    -- the weapon entirely.
+    local aimQ = handQ
+    local okCam, camQ = pcall(function()
+        local cam = Game.GetCameraSystem()
+        return cam and cam:GetActiveCameraOrientation()
+    end)
+    if okCam and camQ then
+        aimQ = camQ
+    end
+    if not headAimLoggedOnce then
+        headAimLoggedOnce = true
+        logAlways("LauncherHeadAim: %s (okCam=%s)",
+            (okCam and camQ) and "camera orientation OK -- using head aim" or "camera orientation unavailable -- falling back to hand aim",
+            tostring(okCam))
+    end
+
+    if type(SetVRMuzzleQuat) == 'function' then
+        SetVRMuzzleQuat(aimQ.i, aimQ.j, aimQ.k, aimQ.r)
+    end
+    if type(SetVRMuzzlePos) ~= 'function' then return end
+
+    -- Origin: still the hand's own position, nudged toward the barrel tip along the HAND's basis
+    -- (not the camera's) -- this is about where the launcher physically sits, not which way it aims.
+    local ox, oy, oz = x, y, z
+    pcall(function()
+        local f = Quaternion.GetForward(handQ)
+        local r = type(Quaternion.GetRight) == 'function' and Quaternion.GetRight(handQ) or nil
+        local u = type(Quaternion.GetUp) == 'function' and Quaternion.GetUp(handQ) or nil
+        if f then
+            ox = ox + f.x * MUZZLE_TIP_OFFSET_FWD
+            oy = oy + f.y * MUZZLE_TIP_OFFSET_FWD
+            oz = oz + f.z * MUZZLE_TIP_OFFSET_FWD
+        end
+        if r and MUZZLE_TIP_OFFSET_RIGHT ~= 0.0 then
+            ox = ox + r.x * MUZZLE_TIP_OFFSET_RIGHT
+            oy = oy + r.y * MUZZLE_TIP_OFFSET_RIGHT
+            oz = oz + r.z * MUZZLE_TIP_OFFSET_RIGHT
+        end
+        if u and MUZZLE_TIP_OFFSET_UP ~= 0.0 then
+            ox = ox + u.x * MUZZLE_TIP_OFFSET_UP
+            oy = oy + u.y * MUZZLE_TIP_OFFSET_UP
+            oz = oz + u.z * MUZZLE_TIP_OFFSET_UP
+        end
+    end)
+
+    SetVRMuzzlePos(ox, oy, oz)
+    if type(SetVRAimHit) ~= 'function' then return end
+    pcall(function()
+        local f = Quaternion.GetForward(aimQ)
+        if not f then return end
+        local o = Vector4.new(ox, oy, oz, 1)
+        local far = Vector4.new(ox + f.x * 200.0, oy + f.y * 200.0, oz + f.z * 200.0, 1)
+        local sq = Game.GetSpatialQueriesSystem()
+        if not sq then return end
+        local ok, res = sq:SyncRaycastByCollisionGroup(o, far, CName.new("Static"), false, false)
+        if ok and res and res.position then
+            local n = res.normal
+            SetVRAimHit(res.position.x, res.position.y, res.position.z,
+                        n and n.x or 0.0, n and n.y or 0.0, n and n.z or 0.0)
+        end
+    end)
+end
+
+-- 0 = left hand, 1 = right hand (native param is named `right`). Flip this if testing shows the
+-- launcher tracking the wrong arm.
+local CYBERARM_HAND_INDEX = 0
+-- Cyberware arm fix - projectile launcher end - RA01
+
+local function updateMuzzle(wpn, precomputedLow)
+    -- Cyberware arm fix - coupled head aim - projectile launcher start p2 - RA01
+    -- RA01: `precomputedLow` is the SAME TDBID reverse-lookup the onUpdate caller already did once
+    -- this tick, passed in instead of this function doing its own independent
+    -- TDBID.ToStringDEBUG call. This function used to make that call itself, which made it the
+    -- FIRST of what became (with isProjLauncher2 and the mantis/gorilla/monowire check) three
+    -- separate calls on the same item ID every single tick -- and one of those extra calls was
+    -- observed (weaponflag_probe.txt) to reliably come back nil. One shared lookup per tick avoids
+    -- the whole class of bug. Falls back to its own lookup only if called without one, so nothing
+    -- else that might call this directly breaks.
+    local low = precomputedLow
+    if low == nil then
+        pcall(function()
+            local key = TDBID.ToStringDEBUG(ItemID.GetTDBID(wpn:GetItemID()))
+            if key then low = string.lower(key) end
+        end)
+    end
+    local isCyberArmRanged = low ~= nil and string.find(low, 'projectilelauncher', 1, true) ~= nil
+    if isCyberArmRanged and type(VRHandRawWorld) == 'function' and type(VRHandRawRot) == 'function' then
+        local okP, pos = pcall(VRHandRawWorld, CYBERARM_HAND_INDEX)
+        local okR, rot = pcall(VRHandRawRot, CYBERARM_HAND_INDEX)
+        if okP and okR and pos and rot then
+            publishMuzzleFromHand(pos.x, pos.y, pos.z, rot.i, rot.j, rot.k, rot.r)
+            return
+        end
+    end
+
     local xf = wpn:GetMuzzleSlotWorldTransform()
     if not xf then return end
+    -- Cyberware arm fix - projectile launcher start p2 - RA01
+
     local q = xf.Orientation or (xf.GetOrientation and xf:GetOrientation())
     if q and type(SetVRMuzzleQuat) == 'function' then
         SetVRMuzzleQuat(q.i, q.j, q.k, q.r)
@@ -608,6 +761,75 @@ local function qrotv(i, j, k, r, x, y, z)
     return x + r*tx + (j*tz - k*ty),
            y + r*ty + (k*tx - i*tz),
            z + r*tz + (i*ty - j*tx)
+end
+
+-- The firing hook only needs the sight ORIGIN. Its forward is already the live muzzle transform's
+-- +Y axis, which is also the weapon-mounted sight direction used by this mode. Prefer the game's own
+-- scope/iron offset; fall back to the corresponding weapon-rig slot for weapons whose accessor does
+-- not resolve. Every failed frame publishes invalid so a weapon swap cannot reuse the old sight.
+local function publishSightOrigin(wpn)
+    if type(SetVRSightOrigin) ~= 'function' then return end
+    if not wpn then
+        SetVRSightOrigin(0.0, 0.0, 0.0, 0)
+        return
+    end
+
+    local hasScope = false
+    pcall(function() hasScope = wpn:HasScope() == true end)
+
+    local base, rot, off = nil, nil, nil
+    pcall(function() base = wpn:GetWorldPosition() end)
+    pcall(function() rot = wpn:GetWorldOrientation() end)
+    pcall(function()
+        off = hasScope and wpn:GetScopeOffset() or wpn:GetIronSightOffset()
+    end)
+    if base and rot and off then
+        local ox, oy, oz = nil, nil, nil
+        pcall(function() ox, oy, oz = off.x, off.y, off.z end)
+        if type(ox) ~= 'number' then
+            pcall(function() ox, oy, oz = off.X, off.Y, off.Z end)
+        end
+        if type(ox) == 'number' and type(oy) == 'number' and type(oz) == 'number' then
+            local rx, ry, rz = qrotv(rot.i, rot.j, rot.k, rot.r, ox, oy, oz)
+            local x, y, z = base.x + rx, base.y + ry, base.z + rz
+            if x*x + y*y + z*z > 1.0 then
+                SetVRSightOrigin(x, y, z, 1)
+                return
+            end
+        end
+    end
+
+    local names = hasScope and { 'scope_slot', 'pos_ironsight' }
+                               or { 'pos_ironsight', 'scope_slot' }
+    local components = nil
+    pcall(function() components = wpn:GetComponents() end)
+    if components then
+        for i = 1, #components do
+            local component = components[i]
+            local isSlot = false
+            pcall(function()
+                isSlot = string.find(tostring(component:GetClassName()), 'SlotComponent', 1, true) ~= nil
+            end)
+            if isSlot then
+                for _, name in ipairs(names) do
+                    local ok, found, tr = pcall(function()
+                        return component:GetSlotTransform(CName.new(name))
+                    end)
+                    if ok and found and tr then
+                        local wp = nil
+                        pcall(function() wp = WorldPosition.ToVector4(tr.Position) end)
+                        if wp and type(wp.x) == 'number' and type(wp.y) == 'number' and
+                           type(wp.z) == 'number' and wp.x*wp.x + wp.y*wp.y + wp.z*wp.z > 1.0 then
+                            SetVRSightOrigin(wp.x, wp.y, wp.z, 1)
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    SetVRSightOrigin(0.0, 0.0, 0.0, 0)
 end
 -- Slerp from identity toward (i,j,k,r) by w -- the way home for the offset's rotation half.
 local function qslerpId(i, j, k, r, w)
@@ -872,6 +1094,303 @@ local function carryTick(dt)
     end
 end
 
+-- Trace the weapon's bore against world collision on CET's game-script side. The current
+-- CET/CP2077 build exposes the hit as TraceResult.position; this same contract is already used by
+-- the physical-reload raycast in this tree. Keep physics out of the DXGI Present path.
+local BARREL_RAY_MAX_M = 1000.0
+local BARREL_RAY_PRESET = 'Sight Blocker'
+local BARREL_LOS_ENDPOINT_OFFSET_M = 0.005
+local BARREL_LOS_GLASS_STEP_M = 0.005
+local BARREL_LOS_MAX_GLASS_HITS = 8
+local BARREL_EYE_MAX_AGE_S = 0.020
+local barrelRaySystem = nil
+local barrelRayCallWarned = false
+local barrelNpcCallWarned = false
+local barrelLosCallWarned = false
+local barrelEyeLastSeq = 0
+local barrelEyeAgeS = math.huge
+local barrelLosLogAt = -1.0
+local barrelRayWasActive = false
+
+local function publishBarrelRayMiss(mainVisible, secondVisible)
+    if type(SetVRBarrelRayHit) == 'function' then
+        SetVRBarrelRayHit(0.0, 0.0, 0.0, 0,
+            mainVisible == false and 0 or 1,
+            secondVisible == false and 0 or 1)
+    end
+end
+
+local function stopBarrelRay()
+    if barrelRayWasActive then
+        publishBarrelRayMiss()
+        barrelRayWasActive = false
+    end
+end
+
+-- Read the two eye origins as one render-side snapshot. A missing or stale packet disables only
+-- occlusion (fail-open); it never disables the existing mode-2 hit provider or direction marker.
+local function readBarrelEyes(dt)
+    barrelEyeAgeS = barrelEyeAgeS + math.max(dt or 0.0, 0.0)
+    for _ = 1, 3 do
+        local s0 = math.floor(GetVRSharedSlot(178) or 0.0)
+        if s0 > 0 and s0 % 2 == 0 then
+            local mx, my, mz = GetVRSharedSlot(172), GetVRSharedSlot(173), GetVRSharedSlot(174)
+            local sx, sy, sz = GetVRSharedSlot(175), GetVRSharedSlot(176), GetVRSharedSlot(177)
+            local s1 = math.floor(GetVRSharedSlot(178) or 0.0)
+            if s0 == s1 and s1 % 2 == 0 then
+                if s1 ~= barrelEyeLastSeq then
+                    barrelEyeLastSeq = s1
+                    barrelEyeAgeS = 0.0
+                end
+                local mainLen2 = mx*mx + my*my + mz*mz
+                local secondLen2 = sx*sx + sy*sy + sz*sz
+                local ex, ey, ez = mx - sx, my - sy, mz - sz
+                local separation2 = ex*ex + ey*ey + ez*ez
+                if barrelEyeAgeS <= BARREL_EYE_MAX_AGE_S and mainLen2 > 1.0 and
+                   secondLen2 > 1.0 and separation2 > 0.0001 and separation2 < 0.04 then
+                    return Vector4.new(mx, my, mz, 1.0), Vector4.new(sx, sy, sz, 1.0)
+                end
+                return nil, nil
+            end
+        end
+    end
+    return nil, nil
+end
+
+local function makeBarrelLosEnd(eye, finalHit, fx, fy, fz)
+    if finalHit then
+        local dx, dy, dz = finalHit.x - eye.x, finalHit.y - eye.y, finalHit.z - eye.z
+        local d2 = dx*dx + dy*dy + dz*dz
+        if d2 <= BARREL_LOS_ENDPOINT_OFFSET_M * BARREL_LOS_ENDPOINT_OFFSET_M then
+            return nil
+        end
+        local invD = 1.0 / math.sqrt(d2)
+        return Vector4.new(
+            finalHit.x - dx * invD * BARREL_LOS_ENDPOINT_OFFSET_M,
+            finalHit.y - dy * invD * BARREL_LOS_ENDPOINT_OFFSET_M,
+            finalHit.z - dz * invD * BARREL_LOS_ENDPOINT_OFFSET_M,
+            1.0)
+    end
+    -- A finite physics segment tests visibility only. The rendered fallback remains optical
+    -- infinity; each eye gets its own parallel segment along the same muzzle direction.
+    return Vector4.new(eye.x + fx * BARREL_RAY_MAX_M,
+                       eye.y + fy * BARREL_RAY_MAX_M,
+                       eye.z + fz * BARREL_RAY_MAX_M, 1.0)
+end
+
+-- Keep the exact EntityID selected by the synchronous redscript nearest-hit query. Identity is an
+-- optional side channel only: a getter/marshalling failure must never discard an otherwise valid
+-- NPC surface hit, because XYZ/W keep their existing contract and Ray B must remain usable.
+local function queryNpcBarrelRay(player, rayStart, rayEnd)
+    if not player or not player.VRFindNpcBarrelRayHit then return nil, nil end
+    local hit = player:VRFindNpcBarrelRayHit(rayStart, rayEnd)
+    if not hit or (hit.w or 0.0) <= 0.5 then return hit, nil end
+    if not player.VRGetNpcBarrelRayEntity then return hit, nil end
+
+    local idOk, entityKey = pcall(function()
+        local entityId = player:VRGetNpcBarrelRayEntity()
+        if not entityId then return nil end
+        return tostring(entityId.hash)
+    end)
+    if not idOk then return hit, nil end
+    return hit, entityKey
+end
+
+local function barrelDotVisibleFromEye(player, eye, finalHit, finalNpcKey, fx, fy, fz)
+    local rayEnd = makeBarrelLosEnd(eye, finalHit, fx, fy, fz)
+    if not rayEnd then return true, 0.0, 'near' end
+
+    -- Use the same world collision semantics already validated by the muzzle provider. The first
+    -- probe's generic QueryFilter missed vehicles and added no proven coverage. Glass materials are
+    -- transparent to the dot LOS: step through each glass hit on the same segment rather than
+    -- declaring the whole remaining segment clear and missing an opaque blocker behind the pane.
+    local dx, dy, dz = rayEnd.x - eye.x, rayEnd.y - eye.y, rayEnd.z - eye.z
+    local rayLengthSq = dx*dx + dy*dy + dz*dz
+    if rayLengthSq <= 0.000001 then return true, 0.0, 'near' end
+    local invRayLength = 1.0 / math.sqrt(rayLengthSq)
+    local dirX, dirY, dirZ = dx * invRayLength, dy * invRayLength, dz * invRayLength
+    local worldStart = eye
+    local glassHits = 0
+    for _ = 1, BARREL_LOS_MAX_GLASS_HITS + 1 do
+        local worldOk, worldSuccess, worldResult = pcall(function()
+            return barrelRaySystem:SyncRaycastByQueryPreset(
+                worldStart, rayEnd, BARREL_RAY_PRESET, false)
+        end)
+        if not worldOk then
+            if not barrelLosCallWarned then
+                barrelLosCallWarned = true
+                logAlways('barrel world LOS failed; visibility remains fail-open: %s',
+                    tostring(worldSuccess))
+            end
+            return true, -1.0, 'world-error'
+        end
+        if not (worldSuccess and worldResult and worldResult.position) then
+            break
+        end
+
+        local p = worldResult.position
+        local materialName = string.lower(tostring(worldResult.material or ''))
+        if not string.find(materialName, 'glass', 1, true) then
+            local bx, by, bz = p.x - eye.x, p.y - eye.y, p.z - eye.z
+            return false, math.sqrt(bx*bx + by*by + bz*bz), 'world'
+        end
+
+        glassHits = glassHits + 1
+        if glassHits > BARREL_LOS_MAX_GLASS_HITS then
+            break
+        end
+        worldStart = Vector4.new(
+            p.x + dirX * BARREL_LOS_GLASS_STEP_M,
+            p.y + dirY * BARREL_LOS_GLASS_STEP_M,
+            p.z + dirZ * BARREL_LOS_GLASS_STEP_M,
+            1.0)
+        local rx, ry, rz = rayEnd.x - worldStart.x, rayEnd.y - worldStart.y,
+                           rayEnd.z - worldStart.z
+        if rx*dirX + ry*dirY + rz*dirZ <= 0.0 then
+            break
+        end
+    end
+
+    -- Sight Blocker intentionally ignores character bodies. Only after the world segment is clear
+    -- ask the already-validated official HitRepresentation provider whether an NPC blocks it.
+    local npcOk, npcResult, npcEntityKey = pcall(function()
+        return queryNpcBarrelRay(player, eye, rayEnd)
+    end)
+    if not npcOk then
+        if not barrelLosCallWarned then
+            barrelLosCallWarned = true
+            logAlways('barrel NPC LOS failed; visibility remains fail-open: %s',
+                tostring(npcResult))
+        end
+        return true, -1.0, 'npc-error'
+    end
+    if npcResult and (npcResult.w or 0.0) > 0.5 then
+        local bx, by, bz = npcResult.x - eye.x, npcResult.y - eye.y, npcResult.z - eye.z
+        local blockM = math.sqrt(bx*bx + by*by + bz*bz)
+        -- Once the muzzle ray has selected this NPC as the actual receiving surface, its own
+        -- overlapping HitRepresentation shapes must not make the aiming dot disappear. A
+        -- different NPC still blocks normally, as do the world/vehicle/prop checks above.
+        if finalNpcKey and npcEntityKey and npcEntityKey == finalNpcKey then
+            return true, blockM,
+                glassHits > 0 and ('npc-self-glass' .. tostring(glassHits)) or 'npc-self'
+        end
+        return false, blockM,
+            glassHits > 0 and ('npc-glass' .. tostring(glassHits)) or 'npc'
+    end
+    return true, -1.0, glassHits > 0 and ('clear-glass' .. tostring(glassHits)) or 'clear'
+end
+
+local function updateBarrelRay(dt)
+    if type(GetVRSharedSlot) ~= 'function' then return end
+    if type(SetVRBarrelRayHit) ~= 'function' then return end
+
+    if GetVRSharedSlot(181) < 0.5 then
+        stopBarrelRay()
+        return
+    end
+    barrelRayWasActive = true
+    if GetVRSharedSlot(27) < 0.5 or GetVRSharedSlot(203) < 0.5 then
+        publishBarrelRayMiss()
+        return
+    end
+
+    local px, py, pz = GetVRSharedSlot(200), GetVRSharedSlot(201), GetVRSharedSlot(202)
+    local fx, fy, fz = GetVRSharedSlot(24), GetVRSharedSlot(25), GetVRSharedSlot(26)
+    local f2 = fx * fx + fy * fy + fz * fz
+    if px * px + py * py + pz * pz < 1.0 or f2 < 0.25 then
+        publishBarrelRayMiss()
+        return
+    end
+
+    local invF = 1.0 / math.sqrt(f2)
+    fx, fy, fz = fx * invF, fy * invF, fz * invF
+    local from = Vector4.new(px, py, pz, 1.0)
+    local to = Vector4.new(px + fx * BARREL_RAY_MAX_M,
+                           py + fy * BARREL_RAY_MAX_M,
+                           pz + fz * BARREL_RAY_MAX_M, 1.0)
+    if barrelRaySystem == nil then
+        barrelRaySystem = Game.GetSpatialQueriesSystem() or false
+    end
+    if not barrelRaySystem then
+        publishBarrelRayMiss()
+        return
+    end
+
+    -- Sight Blocker with dynamic collision covers world, props, vehicles and glass without
+    -- self-hitting the tested player hands or weapons. NPC body surfaces use Ray B below.
+    local worldHit, worldDistanceSq = nil, nil
+    local success, result = barrelRaySystem:SyncRaycastByQueryPreset(
+        from, to, BARREL_RAY_PRESET, false)
+    local launcherReticleActive = false -- RA01
+    local launcherReticleLoggedOnce = false -- RA01
+    if success and result then
+        local p = result.position
+        if p and type(p.x) == 'number' and type(p.y) == 'number' and type(p.z) == 'number' then
+            local dx, dy, dz = p.x - px, p.y - py, p.z - pz
+            worldHit = p
+            worldDistanceSq = dx * dx + dy * dy + dz * dz
+        end
+    end
+
+    -- Ray B uses the exact same from/to and has no cross-frame cache: W=0 is an immediate miss.
+    -- Targeting supplies and deduplicates candidates in redscript; native HitRepresentation gives
+    -- the closest animated body-surface enter point for each candidate.
+    local player = Game.GetPlayer()
+    local npcHit, npcDistanceSq = nil, nil
+    local npcOk, npcResult, npcEntityKey = pcall(function()
+        return queryNpcBarrelRay(player, from, to)
+    end)
+    if npcOk then
+        if npcResult and (npcResult.w or 0.0) > 0.5 and
+           type(npcResult.x) == 'number' and type(npcResult.y) == 'number' and
+           type(npcResult.z) == 'number' then
+            local dx, dy, dz = npcResult.x - px, npcResult.y - py, npcResult.z - pz
+            npcHit = npcResult
+            npcDistanceSq = dx * dx + dy * dy + dz * dz
+        end
+    else
+        if not barrelNpcCallWarned then
+            barrelNpcCallWarned = true
+            logAlways('barrel ray: NPC surface query failed; Ray A remains active: %s',
+                tostring(npcResult))
+        end
+    end
+
+    local finalHit, finalDistanceSq, finalNpcKey = worldHit, worldDistanceSq, nil
+    if npcHit and (not finalDistanceSq or npcDistanceSq < finalDistanceSq) then
+        finalHit, finalDistanceSq, finalNpcKey = npcHit, npcDistanceSq, npcEntityKey
+    end
+
+    local mainVisible, secondVisible = true, true
+    local mainBlockM, secondBlockM = -1.0, -1.0
+    local mainSource, secondSource = 'no-eyes', 'no-eyes'
+    local mainEye, secondEye = readBarrelEyes(dt)
+    if player and mainEye and secondEye then
+        mainVisible, mainBlockM, mainSource = barrelDotVisibleFromEye(
+            player, mainEye, finalHit, finalNpcKey, fx, fy, fz)
+        secondVisible, secondBlockM, secondSource = barrelDotVisibleFromEye(
+            player, secondEye, finalHit, finalNpcKey, fx, fy, fz)
+    end
+    if vrDebug() then
+        local now = (os and os.clock and os.clock()) or 0.0
+        if now - barrelLosLogAt >= 1.0 then
+            barrelLosLogAt = now
+            logAlways('barrel LOS: eyes=%d hit=%d main=%s/%s block=%.3fm second=%s/%s block=%.3fm',
+                (mainEye and secondEye) and 1 or 0,
+                finalHit and 1 or 0,
+                mainVisible and 'clear' or 'blocked', mainSource, mainBlockM,
+                secondVisible and 'clear' or 'blocked', secondSource, secondBlockM)
+        end
+    end
+    if finalHit then
+        SetVRBarrelRayHit(finalHit.x, finalHit.y, finalHit.z, 1,
+            mainVisible and 1 or 0, secondVisible and 1 or 0)
+        return
+    end
+
+    publishBarrelRayMiss(mainVisible, secondVisible)
+end
+
 registerForEvent('onInit', function()
     logf("weapon-aim init")
 end)
@@ -904,23 +1423,143 @@ registerForEvent('onUpdate', function(dt)
     pcall(function()
         local pl = Game.GetPlayer()
         local wpn = pl and pl:GetActiveWeapon()
+
+        -- RA01: classify the equipped weapon ONCE PER EQUIP, not every frame. See the persistent-cache
+        -- comment near the top of the file for the full story: weaponflag_probe.txt proved that calling
+        -- TDBID.ToStringDEBUG(ItemID.GetTDBID(wpn:GetItemID())) fresh every single frame reliably came
+        -- back wrong for Mantis Blades/Gorilla Arms/Monowire (never once resolved correctly across three
+        -- full sessions), while killCameraRecoil's identical call -- gated by its own `recoilKilled ==
+        -- wid` so it only ever runs once per equip -- got every item right 100% of the time in
+        -- recoil_probe.txt. This mirrors that gating: identity from wpn:GetEntityID().hash, the same
+        -- check killCameraRecoil and the equip-sound logic further down already use.
+        local curClassifyWid = nil
+        if wpn then pcall(function() curClassifyWid = tostring(wpn:GetEntityID().hash) end) end
+        if curClassifyWid ~= weaponClassifyWid then
+            weaponClassifyWid = curClassifyWid
+            weaponClassifyLow = nil
+            weaponClassifyIsMelee = false
+            weaponClassifyIsMantis = false
+            weaponClassifyIsGorilla = false
+            weaponClassifyIsMonowire = false
+            weaponClassifyIsLauncher = false
+            if wpn then
+                pcall(function()
+                    local key = nil
+                    pcall(function() key = TDBID.ToStringDEBUG(ItemID.GetTDBID(wpn:GetItemID())) end)
+                    local low = key and string.lower(key) or nil
+                    weaponClassifyLow = low
+                    weaponClassifyIsMelee = WeaponObject.IsMelee(wpn:GetItemID())
+                    -- Cyberware arm weapons don't come back true from IsMelee(), and GetWeaponRecord()
+                    -- is nil for them too -- identify by TDBID name instead.
+                    if low and string.find(low, 'mantis', 1, true) then
+                        weaponClassifyIsMantis = true
+                        weaponClassifyIsMelee = true -- let it ride the same swing-detection pipeline as swords
+                    end
+                    if low and (string.find(low, 'strongarms', 1, true) or string.find(low, 'gorilla', 1, true)) then
+                        weaponClassifyIsGorilla = true
+                        weaponClassifyIsMelee = true
+                    end
+                    if low and (string.find(low, 'nanowires', 1, true) or string.find(low, 'monowire', 1, true)) then
+                        weaponClassifyIsMonowire = true
+                        weaponClassifyIsMelee = true
+                    end
+                    if low and string.find(low, 'projectilelauncher', 1, true) then
+                        weaponClassifyIsLauncher = true
+                    end
+                end)
+            end
+        end
+        local classifyLow = weaponClassifyLow
+        local isMeleeWeapon = weaponClassifyIsMelee
+        local isMantisBlades = weaponClassifyIsMantis
+        local isGorillaArms = weaponClassifyIsGorilla
+        local isMonowire = weaponClassifyIsMonowire
+        local isProjLauncher2 = weaponClassifyIsLauncher
+
         -- THE MUZZLE GOES FIRST, AND NOTHING IS ALLOWED IN FRONT OF IT. Everything in this callback
         -- shares one pcall, so whatever runs first owns the frame: put something ahead of this line and
         -- a throw in it stops the muzzle quaternion from being published at all, the plugin keeps
         -- yesterday's orientation, and the bullet leaves the barrel pointing the wrong way. That was
         -- tried -- the recoil block was moved above this line to isolate it -- and the aim broke
         -- immediately. Isolation belongs in the OTHER direction: the muzzle keeps its place and the
-        -- newcomer gets its own pcall.
-        if wpn then updateMuzzle(wpn) end
+        -- newcomer gets its own pcall. (The cached classification above stays ahead of even this: it's
+        -- a plain local read on every frame except the rare one where the weapon just changed, and it
+        -- has to exist before updateMuzzle can be handed it.)
+        if wpn then updateMuzzle(wpn, classifyLow) end
+
+        if isProjLauncher2 and type(VRHandRawRot) == 'function' then
+            local now2 = (os and os.clock and os.clock()) or 0.0
+            if not axisProbeAt or now2 - axisProbeAt > 0.5 then
+                axisProbeAt = now2
+                local okR, rot = pcall(VRHandRawRot, CYBERARM_HAND_INDEX)
+                if okR and rot then
+                    local rq = Quaternion.new(rot.i, rot.j, rot.k, rot.r)
+                    local fwd = Quaternion.GetForward(rq)
+                    local right = type(Quaternion.GetRight) == 'function' and Quaternion.GetRight(rq) or nil
+                    local up = type(Quaternion.GetUp) == 'function' and Quaternion.GetUp(rq) or nil
+                    local pf = Game.GetPlayer() and Game.GetPlayer():GetWorldForward()
+                    logAlways("AxisProbe: handFwd=(%.2f,%.2f,%.2f) handRight=(%s) handUp=(%s) playerFwd=(%.2f,%.2f,%.2f)",
+                        fwd.x, fwd.y, fwd.z, tostring(right), tostring(up),
+                        pf and pf.x or -9, pf and pf.y or -9, pf and pf.z or -9)
+                end
+            end
+        end
+
+        -- RA01: isMeleeWeapon stays TRUE for monowire (needed so the swing/RT-fire pipeline below
+        -- still runs). This used to also be excluded from the published flag because it drove a
+        -- non-VRIK ADS arm-pose solver that mis-posed monowire's wire on equip -- that solver is
+        -- gone now (the remaining arm-pose behavior for monowire is VRIK's, not this flag's), so
+        -- the exclusion is pointless and monowire now publishes "melee weapon" like the rest.
+        local publishMeleeFlag = isMeleeWeapon
+        if type(SetVRMeleeWeaponState) == 'function' then
+            SetVRMeleeWeaponState(publishMeleeFlag and 1 or 0)
+        end
+        -- kWeaponFlag (native shared[144]) gates the firearm-oriented ADS arm-pose solver and
+        -- the laser-dot overlay, both of which assume a real gun's muzzle-slot geometry. It used
+        -- to be auto-detected natively from equippedRightHandWeapon being non-null, but every
+        -- cyberware item classified above also occupies that same equip slot while active, so a
+        -- native "is anything equipped" test could never tell a real gun from cyberware -- that
+        -- was the actual cause of the intermittent Launcher/Monowire mis-render bug, not
+        -- staleness. This is the single source of truth for slot 144 now (native no longer
+        -- writes it in LocateCamera.cpp), same pattern as the melee flag above.
+        local publishWeaponFlag = (wpn ~= nil) and not isMeleeWeapon and not isMonowire
+            and not isMantisBlades and not isGorillaArms and not isProjLauncher2
+        if type(SetVRWeaponState) == 'function' then
+            SetVRWeaponState(publishWeaponFlag and 1 or 0)
+        end
+        -- kCyberwareFlag (native shared[145]) -- RA01, round 4. kWeaponFlag and kMeleeWeaponFlag
+        -- being correctly false for this cyberware (neither pose model fits it) had a side effect
+        -- nobody intended: AnimPose.cpp's per-frame early-out only lets the weapon-bone positioning
+        -- pass run when kWeaponFlag (or head aim, or a few unrelated diagnostic flags) is set, so
+        -- with both flags off, Mantis Blades/Gorilla Arms/Monowire/Launcher stopped getting their
+        -- held pose updated at all once the equip animation ended -- frozen until a full relaunch.
+        -- This republishes the SAME classification a third way, purely so that early-out can let
+        -- cyberware's bones keep updating too, without re-enabling the real-gun ADS/ballistic solver
+        -- (that stays correctly gated on kWeaponFlag alone in AnimPose.cpp).
+        local publishCyberwareFlag = isMonowire or isMantisBlades or isGorillaArms or isProjLauncher2
+        if type(SetVRCyberwareState) == 'function' then
+            SetVRCyberwareState(publishCyberwareFlag and 1 or 0)
+        end
+        local okSight = pcall(function() publishSightOrigin(wpn) end)
+        if not okSight and type(SetVRSightOrigin) == 'function' then
+            SetVRSightOrigin(0.0, 0.0, 0.0, 0)
+        end
+        local okRay, errRay = pcall(function()
+            if wpn then updateBarrelRay(dt) else stopBarrelRay() end
+        end)
+        if not okRay then
+            publishBarrelRayMiss()
+            if not barrelRayCallWarned then
+                barrelRayCallWarned = true
+                logAlways('barrel ray: query failed: %s', tostring(errRay))
+            end
+        end
         if wpn then
             local wid = nil
             pcall(function() wid = tostring(wpn:GetEntityID().hash) end)
             local okR, errR = pcall(killCameraRecoil, wpn, wid)
             if not okR then
-                pcall(function()
-                    local f = io.open('recoil_probe.txt', 'a')
-                    if f then f:write('killCameraRecoil threw: ' .. tostring(errR) .. string.char(10)); f:close() end
-                end)
+                logAlways('killCameraRecoil threw: %s', tostring(errR))
             end
         end
 
@@ -961,9 +1600,7 @@ registerForEvent('onUpdate', function(dt)
             guardWasOn = false
             return
         end
-        local isMelee = false
-        pcall(function() isMelee = WeaponObject.IsMelee(wpn:GetItemID()) end)
-        if not isMelee then
+        if not isMeleeWeapon then
             guardStats(pl, false, false)
             guardWasOn = false
             return
@@ -990,7 +1627,9 @@ registerForEvent('onUpdate', function(dt)
             speed = math.sqrt(dx*dx + dy*dy + dz*dz) / math.max(dt or 0.016, 0.001)
         end
         meleePrevRel = rel
-
+                if speed > 0.3 then
+            -- logAlways("VRSpeedProbe: speed=%.2f isMantis=%s", speed, tostring(isMantisBlades))
+        end
         -- VR GUARD decision (see the header above): guard ON unless the blade points into the
         -- forward thrust cone. thrust = dot(normalized 3D blade fwd, normalized horizontal body
         -- fwd): forward-horizontal ≈ 1 (no guard), up/down/across ≈ 0, reverse < 0 (guard).
@@ -1079,6 +1718,70 @@ registerForEvent('onUpdate', function(dt)
             if type(GetVRMeleeTrigger) == 'function' then strong = (GetVRMeleeTrigger() == 1) end
             pcall(function() pl:VRMeleeBladeHit(wpn, wp, fwd, MELEE_BOX, strong) end)
         end
+        -- CYBER-ARM MELEE RT -- mantis blades, gorilla arms and monowire all share the same problem:
+        -- wpn:GetWorldPosition() stays flat for cyberware arm weapons (confirmed for mantis by testing),
+        -- so swing speed comes from hand position directly (shared memory: [1..3] left, [9..11] right --
+        -- see include/Utils/SharedSlots.hpp) instead of the weapon pipeline above. These cyberware are
+        -- dual-wielded (both forearms get the model), so BOTH hands are tracked independently and either
+        -- one swinging past threshold fires the RT tap -- previously only the right hand was watched at
+        -- all, which meant a left-hand swing (very natural for e.g. an off-hand Mantis Blades slash)
+        -- silently never fired the native attack.
+        -- RA01 --start
+        local isCyberMeleeArm = isMantisBlades or isGorillaArms or isMonowire
+        if isCyberMeleeArm and type(GetVRSharedSlot) == 'function' then
+            local which = isMantisBlades and 'mantis' or (isGorillaArms and 'gorilla' or 'monowire')
+            if not cyberMeleeArmLoggedOnce[which] then
+                cyberMeleeArmLoggedOnce[which] = true
+                logAlways("CyberMeleeArm: detected=%s (tracking BOTH hands: left slots 1-3, right slots 9-11)", which)
+            end
+
+            -- RIGHT hand (slots 9-11)
+            local hx, hy, hz = GetVRSharedSlot(9), GetVRSharedSlot(10), GetVRSharedSlot(11)
+            local handSpeed = 0.0
+            if mantisPrevHand then
+                local dx = hx - mantisPrevHand.x
+                local dy = hy - mantisPrevHand.y
+                local dz = hz - mantisPrevHand.z
+                handSpeed = math.sqrt(dx*dx + dy*dy + dz*dz) / math.max(dt or 0.016, 0.001)
+            end
+            mantisPrevHand = { x = hx, y = hy, z = hz }
+
+            -- LEFT hand (slots 1-3) -- RA01
+            local lx, ly, lz = GetVRSharedSlot(1), GetVRSharedSlot(2), GetVRSharedSlot(3)
+            local handSpeedLeft = 0.0
+            if mantisPrevHandLeft then
+                local dxl = lx - mantisPrevHandLeft.x
+                local dyl = ly - mantisPrevHandLeft.y
+                local dzl = lz - mantisPrevHandLeft.z
+                handSpeedLeft = math.sqrt(dxl*dxl + dyl*dyl + dzl*dzl) / math.max(dt or 0.016, 0.001)
+            end
+            mantisPrevHandLeft = { x = lx, y = ly, z = lz }
+
+            -- RA01: edge-trigger + re-arm (same idea as the whoosh gate above) -- fire ONE RT tap per
+            -- swing episode instead of holding RT down for the whole swing's duration above threshold.
+            -- Each hand has its own independent armed/re-arm state so one hand resting doesn't block
+            -- the other from firing.
+            if handSpeed < MELEE_REARM_SPEED then
+                cyberMeleeArmArmed = true
+            elseif cyberMeleeArmArmed and handSpeed >= MELEE_SWING_SPEED and handSpeed < 20.0
+               and guardClock >= whooshEquipUntil then
+                cyberMeleeArmArmed = false
+                if type(SetVRMeleeFire) == 'function' then
+                    pcall(function() SetVRMeleeFire(1) end)
+                end
+            end
+
+            if handSpeedLeft < MELEE_REARM_SPEED then
+                cyberMeleeArmArmedLeft = true
+            elseif cyberMeleeArmArmedLeft and handSpeedLeft >= MELEE_SWING_SPEED and handSpeedLeft < 20.0
+               and guardClock >= whooshEquipUntil then
+                cyberMeleeArmArmedLeft = false
+                if type(SetVRMeleeFire) == 'function' then
+                    pcall(function() SetVRMeleeFire(1) end)
+                end
+            end
+        end
+        -- RA01 --end
     end)
 end)
 
